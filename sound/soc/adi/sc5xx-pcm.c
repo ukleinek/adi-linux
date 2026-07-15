@@ -172,7 +172,7 @@ static const struct snd_soc_component_driver sc5xx_pcm_component = {
 	.prepare	= sc5xx_pcm_prepare,
 	.trigger	= sc5xx_pcm_trigger,
 	.pointer	= sc5xx_pcm_pointer,
-	.pcm_construct	= sc5xx_pcm_new,
+	.pcm_new	= sc5xx_pcm_new,
 };
 
 static int sc5xx_soc_platform_probe(struct platform_device *pdev)

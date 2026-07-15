@@ -17,6 +17,7 @@
 #include <linux/ptrace.h>
 #include <linux/ctype.h>
 #include <linux/sysctl.h>
+#include <linux/sysfs.h>
 #include <linux/audit.h>
 #include <linux/user_namespace.h>
 #include <linux/netfilter_ipv4.h>
@@ -32,6 +33,7 @@
 #include "include/audit.h"
 #include "include/capability.h"
 #include "include/cred.h"
+#include "include/crypto.h"
 #include "include/file.h"
 #include "include/ipc.h"
 #include "include/net.h"
@@ -408,7 +410,7 @@ static int apparmor_path_rename(const struct path *old_dir, struct dentry *old_d
 			struct path_cond cond_exchange = {
 				.mode = d_backing_inode(new_dentry)->i_mode,
 			};
-			vfsuid = i_uid_into_vfsuid(idmap, d_backing_inode(old_dentry));
+			vfsuid = i_uid_into_vfsuid(idmap, d_backing_inode(new_dentry));
 			cond_exchange.uid = vfsuid_into_kuid(vfsuid);
 
 			error = aa_path_perm(OP_RENAME_SRC, current_cred(),
@@ -855,12 +857,9 @@ static int do_setattr(u64 attr, void *value, size_t size)
 
 	/* AppArmor requires that the buffer must be null terminated atm */
 	if (args[size - 1] != '\0') {
-		/* null terminate */
-		largs = args = kmalloc(size + 1, GFP_KERNEL);
+		largs = args = kmemdup_nul(value, size, GFP_KERNEL);
 		if (!args)
 			return -ENOMEM;
-		memcpy(args, value, size);
-		args[size] = '\0';
 	}
 
 	error = -EINVAL;
@@ -1423,7 +1422,21 @@ static int aa_sock_msg_perm(const char *op, u32 request, struct socket *sock,
 static int apparmor_socket_sendmsg(struct socket *sock,
 				   struct msghdr *msg, int size)
 {
-	return aa_sock_msg_perm(OP_SENDMSG, AA_MAY_SEND, sock, msg, size);
+	int error = aa_sock_msg_perm(OP_SENDMSG, AA_MAY_SEND, sock, msg, size);
+
+	if (error)
+		return error;
+
+	/* TCP fast open carries connect() semantics in sendmsg(); mediate
+	 * the implicit connect so it cannot bypass the connect permission.
+	 */
+	if ((msg->msg_flags & MSG_FASTOPEN) && msg->msg_name &&
+	    (sk_is_tcp(sock->sk) ||
+	     (sk_is_inet(sock->sk) && sock->sk->sk_type == SOCK_STREAM &&
+	      sock->sk->sk_protocol == IPPROTO_MPTCP)))
+		error = aa_sk_perm(OP_CONNECT, AA_MAY_CONNECT, sock->sk);
+
+	return error;
 }
 
 static int apparmor_socket_recvmsg(struct socket *sock,
@@ -1494,7 +1507,7 @@ static int apparmor_socket_shutdown(struct socket *sock, int how)
  *
  * Note: can not sleep may be called with locks held
  *
- * dont want protocol specific in __skb_recv_datagram()
+ * don't want protocol specific in __skb_recv_datagram()
  * to deny an incoming connection  socket_sock_rcv_skb()
  */
 static int apparmor_socket_sock_rcv_skb(struct sock *sk, struct sk_buff *skb)
@@ -1525,15 +1538,11 @@ static int apparmor_socket_sock_rcv_skb(struct sock *sk, struct sk_buff *skb)
 static struct aa_label *sk_peer_get_label(struct sock *sk)
 {
 	struct aa_sk_ctx *ctx = aa_sock(sk);
-	struct aa_label *label = ERR_PTR(-ENOPROTOOPT);
 
 	if (rcu_access_pointer(ctx->peer))
 		return aa_get_label_rcu(&ctx->peer);
 
-	if (sk->sk_family != PF_UNIX)
-		return ERR_PTR(-ENOPROTOOPT);
-
-	return label;
+	return ERR_PTR(-ENOPROTOOPT);
 }
 
 /**
@@ -2070,7 +2079,7 @@ static int param_get_audit(char *buffer, const struct kernel_param *kp)
 		return -EINVAL;
 	if (apparmor_initialized && !aa_current_policy_view_capable(NULL))
 		return -EPERM;
-	return sprintf(buffer, "%s", audit_mode_names[aa_g_audit]);
+	return sysfs_emit(buffer, "%s\n", audit_mode_names[aa_g_audit]);
 }
 
 static int param_set_audit(const char *val, const struct kernel_param *kp)
@@ -2098,8 +2107,7 @@ static int param_get_mode(char *buffer, const struct kernel_param *kp)
 		return -EINVAL;
 	if (apparmor_initialized && !aa_current_policy_view_capable(NULL))
 		return -EPERM;
-
-	return sprintf(buffer, "%s", aa_profile_mode_names[aa_g_profile_mode]);
+	return sysfs_emit(buffer, "%s\n", aa_profile_mode_names[aa_g_profile_mode]);
 }
 
 static int param_set_mode(const char *val, const struct kernel_param *kp)
@@ -2122,6 +2130,23 @@ static int param_set_mode(const char *val, const struct kernel_param *kp)
 	return 0;
 }
 
+/* arbitrary cap on how long to hold buffer because contention was
+ * encountered before trying to put it back into the global pool
+ */
+#define MAX_HOLD_COUNT 64
+
+/* the hold count is a heuristic for lock contention, and can be
+ * incremented async to actual buffer alloc/free.  Because buffers
+ * may be put back onto a percpu cache different than the ->hold was
+ * added to the counts can be out of sync. Guard against underflow
+ * and overflow
+ */
+static void cache_hold_inc(unsigned int *hold)
+{
+	if (*hold < MAX_HOLD_COUNT)
+		(*hold)++;
+}
+
 char *aa_get_buffer(bool in_atomic)
 {
 	union aa_buffer *aa_buf;
@@ -2140,16 +2165,20 @@ char *aa_get_buffer(bool in_atomic)
 		put_cpu_ptr(&aa_local_buffers);
 		return &aa_buf->buffer[0];
 	}
+	/* exit percpu as spinlocks may sleep on realtime kernels */
 	put_cpu_ptr(&aa_local_buffers);
 
 	if (!spin_trylock(&aa_buffers_lock)) {
+		/* had contention on lock so increase hold count. Doesn't
+		 * really matter if recorded before or after the spin lock
+		 * as there is no way to guarantee the buffer will be put
+		 * back on the same percpu cache. Instead rely on holds
+		 * roughly averaging out over time.
+		 */
 		cache = get_cpu_ptr(&aa_local_buffers);
-		cache->hold += 1;
+		cache_hold_inc(&cache->hold);
 		put_cpu_ptr(&aa_local_buffers);
 		spin_lock(&aa_buffers_lock);
-	} else {
-		cache = get_cpu_ptr(&aa_local_buffers);
-		put_cpu_ptr(&aa_local_buffers);
 	}
 retry:
 	if (buffer_count > reserve_count ||
@@ -2204,13 +2233,11 @@ void aa_put_buffer(char *buf)
 			list_add(&aa_buf->list, &aa_global_buffers);
 			buffer_count++;
 			spin_unlock(&aa_buffers_lock);
-			cache = get_cpu_ptr(&aa_local_buffers);
-			put_cpu_ptr(&aa_local_buffers);
 			return;
 		}
 		/* contention on global list, fallback to percpu */
 		cache = get_cpu_ptr(&aa_local_buffers);
-		cache->hold += 1;
+		cache_hold_inc(&cache->hold);
 	}
 
 	/* cache in percpu list */
@@ -2417,7 +2444,6 @@ static int __init apparmor_nf_ip_init(void)
 
 	return 0;
 }
-__initcall(apparmor_nf_ip_init);
 #endif
 
 static char nulldfa_src[] __aligned(8) = {
@@ -2444,10 +2470,11 @@ static int __init aa_setup_dfa_engine(void)
 			    TO_ACCEPT2_FLAG(YYTD_DATA32));
 	if (IS_ERR(nulldfa)) {
 		error = PTR_ERR(nulldfa);
+		nulldfa = NULL;
 		goto fail;
 	}
 	nullpdb->dfa = aa_get_dfa(nulldfa);
-	nullpdb->perms = kcalloc(2, sizeof(struct aa_perms), GFP_KERNEL);
+	nullpdb->perms = kzalloc_objs(struct aa_perms, 2);
 	if (!nullpdb->perms)
 		goto fail;
 	nullpdb->size = 2;
@@ -2546,9 +2573,16 @@ alloc_out:
 }
 
 DEFINE_LSM(apparmor) = {
-	.name = "apparmor",
+	.id = &apparmor_lsmid,
 	.flags = LSM_FLAG_LEGACY_MAJOR | LSM_FLAG_EXCLUSIVE,
 	.enabled = &apparmor_enabled,
 	.blobs = &apparmor_blob_sizes,
 	.init = apparmor_init,
+	.initcall_fs = aa_create_aafs,
+#if defined(CONFIG_NETFILTER) && defined(CONFIG_NETWORK_SECMARK)
+	.initcall_device = apparmor_nf_ip_init,
+#endif
+#ifdef CONFIG_SECURITY_APPARMOR_HASH
+	.initcall_late = init_profile_hash,
+#endif
 };

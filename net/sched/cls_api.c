@@ -84,7 +84,7 @@ tcf_exts_miss_cookie_base_alloc(struct tcf_exts *exts, struct tcf_proto *tp,
 	if (WARN_ON(!handle || !tp->ops->get_exts))
 		return -EINVAL;
 
-	n = kzalloc(sizeof(*n), GFP_KERNEL);
+	n = kzalloc_obj(*n);
 	if (!n)
 		return -ENOMEM;
 
@@ -377,7 +377,7 @@ static struct tcf_proto *tcf_proto_create(const char *kind, u32 protocol,
 	struct tcf_proto *tp;
 	int err;
 
-	tp = kzalloc(sizeof(*tp), GFP_KERNEL);
+	tp = kzalloc_obj(*tp);
 	if (!tp)
 		return ERR_PTR(-ENOBUFS);
 
@@ -502,7 +502,7 @@ static struct tcf_chain *tcf_chain_create(struct tcf_block *block,
 
 	ASSERT_BLOCK_LOCKED(block);
 
-	chain = kzalloc(sizeof(*chain), GFP_KERNEL);
+	chain = kzalloc_obj(*chain);
 	if (!chain)
 		return NULL;
 	list_add_tail_rcu(&chain->list, &block->chain_list);
@@ -918,7 +918,7 @@ tcf_chain0_head_change_cb_add(struct tcf_block *block,
 	struct tcf_filter_chain_list_item *item;
 	struct tcf_chain *chain0;
 
-	item = kmalloc(sizeof(*item), GFP_KERNEL);
+	item = kmalloc_obj(*item);
 	if (!item) {
 		NL_SET_ERR_MSG(extack, "Memory allocation for head change callback item failed");
 		return -ENOMEM;
@@ -1016,7 +1016,7 @@ static struct tcf_block *tcf_block_create(struct net *net, struct Qdisc *q,
 {
 	struct tcf_block *block;
 
-	block = kzalloc(sizeof(*block), GFP_KERNEL);
+	block = kzalloc_obj(*block);
 	if (!block) {
 		NL_SET_ERR_MSG(extack, "Memory allocation for block failed");
 		return ERR_PTR(-ENOMEM);
@@ -1428,7 +1428,7 @@ static int tcf_block_owner_add(struct tcf_block *block,
 {
 	struct tcf_block_owner_item *item;
 
-	item = kmalloc(sizeof(*item), GFP_KERNEL);
+	item = kmalloc_obj(*item);
 	if (!item)
 		return -ENOMEM;
 	item->q = q;
@@ -1866,15 +1866,15 @@ int tcf_classify(struct sk_buff *skb,
 			struct tc_skb_cb *cb = tc_skb_cb(skb);
 
 			ext = tc_skb_ext_alloc(skb);
-			if (WARN_ON_ONCE(!ext)) {
+			if (!ext) {
 				tcf_set_drop_reason(skb, SKB_DROP_REASON_NOMEM);
 				return TC_ACT_SHOT;
 			}
 			ext->chain = last_executed_chain;
 			ext->mru = cb->mru;
-			ext->post_ct = cb->post_ct;
-			ext->post_ct_snat = cb->post_ct_snat;
-			ext->post_ct_dnat = cb->post_ct_dnat;
+			ext->post_ct = qdisc_skb_cb(skb)->post_ct;
+			ext->post_ct_snat = qdisc_skb_cb(skb)->post_ct_snat;
+			ext->post_ct_dnat = qdisc_skb_cb(skb)->post_ct_dnat;
 			ext->zone = cb->zone;
 		}
 	}
@@ -3349,8 +3349,7 @@ int tcf_exts_init_ex(struct tcf_exts *exts, struct net *net, int action,
 	 * This reference might be taken later from tcf_exts_get_net().
 	 */
 	exts->net = net;
-	exts->actions = kcalloc(TCA_ACT_MAX_PRIO, sizeof(struct tc_action *),
-				GFP_KERNEL);
+	exts->actions = kzalloc_objs(struct tc_action *, TCA_ACT_MAX_PRIO);
 	if (!exts->actions)
 		return -ENOMEM;
 #endif
@@ -3887,12 +3886,21 @@ int tc_setup_action(struct flow_action *flow_action,
 
 		entry = &flow_action->entries[j];
 		spin_lock_bh(&act->tcfa_lock);
+
+		/* Abort the offload if we have exhausted the allocated capacity */
+		if (j >= flow_action->num_entries) {
+			NL_SET_ERR_MSG_MOD(extack, "Flow action buffer overflow");
+			err = -ENOSPC;
+			goto err_out_locked;
+		}
+
 		err = tcf_act_get_user_cookie(entry, act);
 		if (err)
 			goto err_out_locked;
 
-		index = 0;
-		err = tc_setup_offload_act(act, entry, &index, extack);
+		index = flow_action->num_entries - j;
+		err = tc_setup_offload_act(act, entry, &index,
+					   extack);
 		if (err)
 			goto err_out_locked;
 
@@ -3946,10 +3954,13 @@ unsigned int tcf_exts_num_actions(struct tcf_exts *exts)
 	int i;
 
 	tcf_exts_for_each_action(i, act, exts) {
-		if (is_tcf_pedit(act))
-			num_acts += tcf_pedit_nkeys(act);
-		else
+		if (is_tcf_pedit(act)) {
+			spin_lock_bh(&act->tcfa_lock);
+			num_acts += tcf_pedit_nkeys_locked(act);
+			spin_unlock_bh(&act->tcfa_lock);
+		} else {
 			num_acts++;
+		}
 	}
 	return num_acts;
 }
@@ -4048,6 +4059,9 @@ struct sk_buff *tcf_qevent_handle(struct tcf_qevent *qe, struct Qdisc *sch, stru
 		return NULL;
 	case TC_ACT_REDIRECT:
 		skb_do_redirect(skb);
+		*ret = __NET_XMIT_STOLEN;
+		return NULL;
+	case TC_ACT_CONSUMED:
 		*ret = __NET_XMIT_STOLEN;
 		return NULL;
 	}

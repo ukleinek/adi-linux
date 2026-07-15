@@ -143,7 +143,7 @@ static void ah_output_done(void *data, int err)
 	}
 
 	kfree(AH_SKB_CB(skb)->tmp);
-	xfrm_output_resume(skb->sk, skb, err);
+	xfrm_output_resume(skb_to_full_sk(skb), skb, err);
 }
 
 static int ah_output(struct xfrm_state *x, struct sk_buff *skb)
@@ -494,7 +494,7 @@ static int ah_init_state(struct xfrm_state *x, struct netlink_ext_ack *extack)
 		goto error;
 	}
 
-	ahp = kzalloc(sizeof(*ahp), GFP_KERNEL);
+	ahp = kzalloc_obj(*ahp);
 	if (!ahp)
 		return -ENOMEM;
 

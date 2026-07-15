@@ -894,8 +894,9 @@ find_format_descriptor(struct usb_interface *interface)
 		struct uac_format_type_i_discrete_descriptor *desc;
 
 		desc = (struct uac_format_type_i_discrete_descriptor *)extra;
-		if (desc->bLength > extralen) {
-			dev_err(&interface->dev, "descriptor overflow\n");
+		if (desc->bLength < sizeof(struct usb_descriptor_header) ||
+		    desc->bLength > extralen) {
+			dev_err(&interface->dev, "invalid descriptor length\n");
 			return NULL;
 		}
 		if (desc->bLength == UAC_FORMAT_TYPE_I_DISCRETE_DESC_SIZE(1) &&
@@ -1069,7 +1070,7 @@ static int alloc_stream_urbs(struct ua101 *ua, struct ua101_stream *stream,
 		while (size >= max_packet_size) {
 			if (u >= stream->queue_length)
 				goto bufsize_error;
-			urb = kmalloc(sizeof(*urb), GFP_KERNEL);
+			urb = kmalloc_obj(*urb);
 			if (!urb)
 				return -ENOMEM;
 			usb_init_urb(&urb->urb);

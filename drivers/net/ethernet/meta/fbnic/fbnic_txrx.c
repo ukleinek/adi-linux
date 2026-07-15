@@ -39,7 +39,7 @@ struct fbnic_xmit_cb {
 
 #define FBNIC_XMIT_NOUNMAP	((void *)1)
 
-static u32 __iomem *fbnic_ring_csr_base(const struct fbnic_ring *ring)
+u32 __iomem *fbnic_ring_csr_base(const struct fbnic_ring *ring)
 {
 	unsigned long csr_base = (unsigned long)ring->doorbell;
 
@@ -194,15 +194,17 @@ static bool fbnic_tx_tstamp(struct sk_buff *skb)
 
 static bool
 fbnic_tx_lso(struct fbnic_ring *ring, struct sk_buff *skb,
-	     struct skb_shared_info *shinfo, __le64 *meta,
-	     unsigned int *l2len, unsigned int *i3len)
+	     __le64 *meta, unsigned int *l2len, unsigned int *i3len)
 {
 	unsigned int l3_type, l4_type, l4len, hdrlen;
+	struct skb_shared_info *shinfo;
 	unsigned char *l4hdr;
 	__be16 payload_len;
 
 	if (unlikely(skb_cow_head(skb, 0)))
 		return true;
+
+	shinfo = skb_shinfo(skb);
 
 	if (shinfo->gso_type & SKB_GSO_PARTIAL) {
 		l3_type = FBNIC_TWD_L3_TYPE_OTHER;
@@ -258,7 +260,6 @@ fbnic_tx_lso(struct fbnic_ring *ring, struct sk_buff *skb,
 static bool
 fbnic_tx_offloads(struct fbnic_ring *ring, struct sk_buff *skb, __le64 *meta)
 {
-	struct skb_shared_info *shinfo = skb_shinfo(skb);
 	unsigned int l2len, i3len;
 
 	if (fbnic_tx_tstamp(skb))
@@ -273,8 +274,8 @@ fbnic_tx_offloads(struct fbnic_ring *ring, struct sk_buff *skb, __le64 *meta)
 	*meta |= cpu_to_le64(FIELD_PREP(FBNIC_TWD_CSUM_OFFSET_MASK,
 					skb->csum_offset / 2));
 
-	if (shinfo->gso_size) {
-		if (fbnic_tx_lso(ring, skb, shinfo, meta, &l2len, &i3len))
+	if (skb_is_gso(skb)) {
+		if (fbnic_tx_lso(ring, skb, meta, &l2len, &i3len))
 			return true;
 	} else {
 		*meta |= cpu_to_le64(FBNIC_TWD_FLAG_REQ_CSO);
@@ -653,7 +654,8 @@ static void fbnic_clean_twq1(struct fbnic_napi_vector *nv, bool pp_allow_direct,
 				 FBNIC_TWD_TYPE_AL;
 		total_bytes += FIELD_GET(FBNIC_TWD_LEN_MASK, twd);
 
-		page_pool_put_page(page->pp, page, -1, pp_allow_direct);
+		page_pool_put_page(pp_page_to_nmdesc(page)->pp, page, -1,
+				   pp_allow_direct);
 next_desc:
 		head++;
 		head &= ring->size_mask;
@@ -887,6 +889,7 @@ static void fbnic_bd_prep(struct fbnic_ring *bdq, u16 id, netmem_ref netmem)
 		*bdq_desc = cpu_to_le64(bd);
 		bd += FIELD_PREP(FBNIC_BD_DESC_ADDR_MASK, 1) |
 		      FIELD_PREP(FBNIC_BD_DESC_ID_MASK, 1);
+		bdq_desc++;
 	} while (--i);
 }
 
@@ -1638,7 +1641,7 @@ static int fbnic_alloc_napi_vector(struct fbnic_dev *fbd, struct fbnic_net *fbn,
 		return -EIO;
 
 	/* Allocate NAPI vector and queue triads */
-	nv = kzalloc(struct_size(nv, qt, qt_count), GFP_KERNEL);
+	nv = kzalloc_flex(*nv, qt, qt_count);
 	if (!nv)
 		return -ENOMEM;
 
@@ -1806,7 +1809,7 @@ int fbnic_alloc_napi_vectors(struct fbnic_net *fbn)
 free_vectors:
 	fbnic_free_napi_vectors(fbn);
 
-	return -ENOMEM;
+	return err;
 }
 
 static void fbnic_free_ring_resources(struct device *dev,
@@ -2251,6 +2254,22 @@ fbnic_nv_disable(struct fbnic_net *fbn, struct fbnic_napi_vector *nv)
 {
 	__fbnic_nv_disable(nv);
 	fbnic_wrfl(fbn->fbd);
+}
+
+void fbnic_dbg_down(struct fbnic_net *fbn)
+{
+	int i;
+
+	for (i = 0; i < fbn->num_napi; i++)
+		fbnic_dbg_nv_exit(fbn->napi[i]);
+}
+
+void fbnic_dbg_up(struct fbnic_net *fbn)
+{
+	int i;
+
+	for (i = 0; i < fbn->num_napi; i++)
+		fbnic_dbg_nv_init(fbn->napi[i]);
 }
 
 void fbnic_disable(struct fbnic_net *fbn)
@@ -2810,7 +2829,9 @@ void fbnic_napi_depletion_check(struct net_device *netdev)
 	fbnic_wrfl(fbd);
 }
 
-static int fbnic_queue_mem_alloc(struct net_device *dev, void *qmem, int idx)
+static int fbnic_queue_mem_alloc(struct net_device *dev,
+				 struct netdev_queue_config *qcfg,
+				 void *qmem, int idx)
 {
 	struct fbnic_net *fbn = netdev_priv(dev);
 	const struct fbnic_q_triad *real;
@@ -2860,9 +2881,12 @@ static void __fbnic_nv_restart(struct fbnic_net *fbn,
 
 	for (i = 0; i < nv->txt_count; i++)
 		netif_wake_subqueue(fbn->netdev, nv->qt[i].sub0.q_idx);
+	fbnic_dbg_nv_init(nv);
 }
 
-static int fbnic_queue_start(struct net_device *dev, void *qmem, int idx)
+static int fbnic_queue_start(struct net_device *dev,
+			     struct netdev_queue_config *qcfg,
+			     void *qmem, int idx)
 {
 	struct fbnic_net *fbn = netdev_priv(dev);
 	struct fbnic_napi_vector *nv;
@@ -2892,6 +2916,7 @@ static int fbnic_queue_stop(struct net_device *dev, void *qmem, int idx)
 
 	real = container_of(fbn->rx[idx], struct fbnic_q_triad, cmpl);
 	nv = fbn->napi[idx % fbn->num_napi];
+	fbnic_dbg_nv_exit(nv);
 
 	napi_disable_locked(&nv->napi);
 	fbnic_nv_irq_disable(nv);

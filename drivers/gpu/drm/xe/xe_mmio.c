@@ -14,12 +14,8 @@
 #include <drm/drm_print.h>
 
 #include "regs/xe_bars.h"
-#include "regs/xe_regs.h"
 #include "xe_device.h"
-#include "xe_gt.h"
-#include "xe_gt_printk.h"
 #include "xe_gt_sriov_vf.h"
-#include "xe_macros.h"
 #include "xe_sriov.h"
 #include "xe_trace.h"
 #include "xe_wa.h"
@@ -156,6 +152,15 @@ u8 xe_mmio_read8(struct xe_mmio *mmio, struct xe_reg reg)
 	trace_xe_reg_rw(mmio, false, addr, val, sizeof(val));
 
 	return val;
+}
+
+void xe_mmio_write8(struct xe_mmio *mmio, struct xe_reg reg, u8 val)
+{
+	u32 addr = xe_mmio_adjusted_addr(mmio, reg.addr);
+
+	trace_xe_reg_rw(mmio, true, addr, val, sizeof(val));
+
+	writeb(val, mmio->regs + addr);
 }
 
 u16 xe_mmio_read16(struct xe_mmio *mmio, struct xe_reg reg)
@@ -379,3 +384,32 @@ int xe_mmio_wait32_not(struct xe_mmio *mmio, struct xe_reg reg, u32 mask, u32 va
 {
 	return __xe_mmio_wait32(mmio, reg, mask, val, timeout_us, out_val, atomic, false);
 }
+
+#ifdef CONFIG_PCI_IOV
+static size_t vf_regs_stride(struct xe_device *xe)
+{
+	return GRAPHICS_VERx100(xe) > 1200 ? 0x400 : 0x1000;
+}
+
+/**
+ * xe_mmio_init_vf_view() - Initialize an MMIO instance for accesses like the VF
+ * @mmio: the target &xe_mmio to initialize as VF's view
+ * @base: the source &xe_mmio to initialize from
+ * @vfid: the VF identifier
+ */
+void xe_mmio_init_vf_view(struct xe_mmio *mmio, const struct xe_mmio *base, unsigned int vfid)
+{
+	struct xe_tile *tile = base->tile;
+	struct xe_device *xe = tile->xe;
+	size_t offset = vf_regs_stride(xe) * vfid;
+
+	xe_assert(xe, IS_SRIOV_PF(xe));
+	xe_assert(xe, vfid);
+	xe_assert(xe, !base->sriov_vf_gt);
+	xe_assert(xe, base->regs_size > offset);
+
+	*mmio = *base;
+	mmio->regs += offset;
+	mmio->regs_size -= offset;
+}
+#endif

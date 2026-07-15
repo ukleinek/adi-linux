@@ -502,7 +502,7 @@ static void sa_delayed_probe(struct work_struct *work)
 		sa_comp.component_driver.prepare = sa_pcm_prepare;
 		sa_comp.component_driver.trigger = sa_pcm_trigger;
 		sa_comp.component_driver.pointer = sa_pcm_pointer;
-		sa_comp.component_driver.pcm_construct = sa_pcm_new;
+		sa_comp.component_driver.pcm_new = sa_pcm_new;
 
 		sa->asoc_platform_devs[sa->platform_num] = platform_device_register_data(
 			dev, "sharc-alsa-platform", link_id, &sa_comp, sizeof(sa_comp));

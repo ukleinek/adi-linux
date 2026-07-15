@@ -218,9 +218,6 @@
 #define ADE9000_ST1_ERROR1_BIT		BIT(29)
 #define ADE9000_ST1_ERROR2_BIT		BIT(30)
 #define ADE9000_ST1_ERROR3_BIT		BIT(31)
-#define ADE9000_ST_ERROR \
-	(ADE9000_ST1_ERROR0 | ADE9000_ST1_ERROR1 | \
-	 ADE9000_ST1_ERROR2 | ADE9000_ST1_ERROR3)
 #define ADE9000_ST1_CROSSING_FIRST	6
 #define ADE9000_ST1_CROSSING_DEPTH	25
 
@@ -283,7 +280,6 @@ enum ade9000_wfb_cfg {
 #define ADE9000_PHASE_C_POS_BIT		BIT(6)
 
 #define ADE9000_MAX_PHASE_NR		3
-#define AD9000_CHANNELS_PER_PHASE	10
 
 /*
  * Calculate register address for multi-phase device.
@@ -964,7 +960,7 @@ static irqreturn_t ade9000_dready_thread(int irq, void *data)
 	struct iio_dev *indio_dev = data;
 
 	/* Handle data ready interrupt from C4/EVENT/DREADY pin */
-	if (!iio_device_claim_buffer_mode(indio_dev)) {
+	if (iio_device_try_claim_buffer_mode(indio_dev)) {
 		ade9000_iio_push_buffer(indio_dev);
 		iio_device_release_buffer_mode(indio_dev);
 	}
@@ -1549,7 +1545,7 @@ static int ade9000_buffer_postdisable(struct iio_dev *indio_dev)
 
 	ret = regmap_clear_bits(st->regmap, ADE9000_REG_MASK0, interrupts);
 	if (ret) {
-		dev_err(dev, "Post-disable update maks0 fail\n");
+		dev_err(dev, "Post-disable update mask0 fail\n");
 		return ret;
 	}
 
@@ -1589,10 +1585,9 @@ static int ade9000_reset(struct ade9000_state *st)
 	/* Only wait for completion if IRQ1 is available to signal reset done */
 	if (fwnode_irq_get_byname(dev_fwnode(dev), "irq1") >= 0) {
 		if (!wait_for_completion_timeout(&st->reset_completion,
-						 msecs_to_jiffies(1000))) {
-			dev_err(dev, "Reset timeout after 1s\n");
-			return -ETIMEDOUT;
-		}
+						 msecs_to_jiffies(1000)))
+			return dev_err_probe(dev, -ETIMEDOUT,
+					     "Reset timeout after 1s\n");
 	}
 	/* If no IRQ available, reset is already complete after the 50ms delay above */
 
@@ -1629,7 +1624,7 @@ static const struct regmap_config ade9000_regmap_config = {
 	.val_bits = 32,
 	.max_register = 0x6bc,
 	.zero_flag_mask = true,
-	.cache_type = REGCACHE_RBTREE,
+	.cache_type = REGCACHE_MAPLE,
 	.reg_read = ade9000_spi_read_reg,
 	.reg_write = ade9000_spi_write_reg,
 	.volatile_reg = ade9000_is_volatile_reg,

@@ -547,7 +547,7 @@ int br_cfm_mep_create(struct net_bridge *br,
 		}
 	}
 
-	mep = kzalloc(sizeof(*mep), GFP_KERNEL);
+	mep = kzalloc_obj(*mep);
 	if (!mep)
 		return -ENOMEM;
 
@@ -693,7 +693,7 @@ int br_cfm_cc_peer_mep_add(struct net_bridge *br, const u32 instance,
 		return -EEXIST;
 	}
 
-	peer_mep = kzalloc(sizeof(*peer_mep), GFP_KERNEL);
+	peer_mep = kzalloc_obj(*peer_mep);
 	if (!peer_mep)
 		return -ENOMEM;
 
@@ -803,6 +803,12 @@ int br_cfm_cc_ccm_tx(struct net_bridge *br, const u32 instance,
 	if (tx_info->period == 0 && mep->cc_ccm_tx_info.period != 0) {
 		cancel_delayed_work_sync(&mep->ccm_tx_dwork);
 		goto save;
+	}
+
+	if (!interval_to_us(mep->cc_config.exp_interval)) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Invalid CCM interval");
+		return -EINVAL;
 	}
 
 	/* Start delayed work to transmit CCM frames. It is done with zero delay

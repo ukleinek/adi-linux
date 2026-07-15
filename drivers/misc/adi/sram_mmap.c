@@ -221,12 +221,7 @@ static void rmem_sram_release(struct reserved_mem *rmem, struct device *dev)
 	info->dev = NULL;
 }
 
-static const struct reserved_mem_ops rmem_sram_ops = {
-	.device_init = rmem_sram_init,
-	.device_release = rmem_sram_release,
-};
-
-static int __init rmem_sram_setup(struct reserved_mem *rmem)
+static int __init rmem_sram_setup(unsigned long node, struct reserved_mem *rmem)
 {
 	if (next_region >= MAX_SRAM_REGIONS) {
 		pr_err("Cannot allocate more SRAM regions--increase MAX_SRAM_REGIONS\n");
@@ -244,7 +239,6 @@ static int __init rmem_sram_setup(struct reserved_mem *rmem)
 		return -EINVAL;
 	}
 
-	rmem->ops = &rmem_sram_ops;
 	rmem->priv = &sram_regions[next_region];
 	sram_regions[next_region].rmem = rmem;
 	next_region += 1;
@@ -253,7 +247,14 @@ static int __init rmem_sram_setup(struct reserved_mem *rmem)
 		&rmem->base, (unsigned long) (rmem->size / SZ_1K));
 	return 0;
 }
-RESERVEDMEM_OF_DECLARE(adi_sram, "adi,sram-access", rmem_sram_setup);
+
+static const struct reserved_mem_ops rmem_sram_ops = {
+	.node_init = rmem_sram_setup,
+	.device_init = rmem_sram_init,
+	.device_release = rmem_sram_release,
+};
+
+RESERVEDMEM_OF_DECLARE(adi_sram, "adi,sram-access", &rmem_sram_ops);
 
 module_platform_driver(adi_sram_mmap_driver);
 

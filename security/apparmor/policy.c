@@ -98,13 +98,21 @@ const char *const aa_profile_mode_names[] = {
 	"user",
 };
 
+void aa_destroy_tags(struct aa_tags_struct *tags)
+{
+	kfree_sensitive(tags->hdrs.table);
+	kfree_sensitive(tags->sets.table);
+	aa_destroy_str_table(&tags->strs);
+	memset(tags, 0, sizeof(*tags));
+}
 
 static void aa_free_pdb(struct aa_policydb *pdb)
 {
 	if (pdb) {
 		aa_put_dfa(pdb->dfa);
 		kvfree(pdb->perms);
-		aa_free_str_table(&pdb->trans);
+		aa_destroy_str_table(&pdb->trans);
+		aa_destroy_tags(&pdb->tags);
 		kfree(pdb);
 	}
 }
@@ -123,7 +131,7 @@ void aa_pdb_free_kref(struct kref *kref)
 
 struct aa_policydb *aa_alloc_pdb(gfp_t gfp)
 {
-	struct aa_policydb *pdb = kzalloc(sizeof(struct aa_policydb), gfp);
+	struct aa_policydb *pdb = kzalloc_obj(struct aa_policydb, gfp);
 
 	if (!pdb)
 		return NULL;
@@ -224,6 +232,13 @@ static void __remove_profile(struct aa_profile *profile)
 	aa_label_remove(&profile->label);
 	__aafs_profile_rmdir(profile);
 	__list_remove_profile(profile);
+	/* rawdata is only ever referenced by fs lookup, that is no
+	 * longer possible here, so put the reference to it. This will
+	 * enable the rawdata to be freed if for some reason the profile
+	 * is pinned and going to live for a while.
+	 */
+	aa_put_profile_loaddata(profile->rawdata);
+	profile->rawdata = NULL;
 }
 
 /**
@@ -248,6 +263,9 @@ static void aa_free_data(void *ptr, void *arg)
 {
 	struct aa_data *data = ptr;
 
+	if (!ptr)
+		return;
+
 	kvfree_sensitive(data->data, data->size);
 	kfree_sensitive(data->key);
 	kfree_sensitive(data);
@@ -256,6 +274,9 @@ static void aa_free_data(void *ptr, void *arg)
 static void free_attachment(struct aa_attachment *attach)
 {
 	int i;
+
+	if (!attach)
+		return;
 
 	for (i = 0; i < attach->xattr_count; i++)
 		kfree_sensitive(attach->xattrs[i]);
@@ -285,7 +306,7 @@ struct aa_ruleset *aa_alloc_ruleset(gfp_t gfp)
 {
 	struct aa_ruleset *rules;
 
-	rules = kzalloc(sizeof(*rules), gfp);
+	rules = kzalloc_obj(*rules, gfp);
 
 	return rules;
 }
@@ -359,7 +380,7 @@ struct aa_profile *aa_alloc_profile(const char *hname, struct aa_proxy *proxy,
 	 * this adds space for a single ruleset in the rules section of the
 	 * label
 	 */
-	profile = kzalloc(struct_size(profile, label.rules, 1), gfp);
+	profile = kzalloc_flex(*profile, label.rules, 1, gfp);
 	if (!profile)
 		return NULL;
 
@@ -721,24 +742,27 @@ struct aa_profile *aa_new_learning_profile(struct aa_profile *parent, bool hat,
 	struct aa_profile *p, *profile;
 	const char *bname;
 	char *name = NULL;
+	size_t name_sz;
 
 	AA_BUG(!parent);
 
 	if (base) {
-		name = kmalloc(strlen(parent->base.hname) + 8 + strlen(base),
-			       gfp);
+		name_sz = strlen(parent->base.hname) + 8 + strlen(base);
+		name = kmalloc(name_sz, gfp);
 		if (name) {
-			sprintf(name, "%s//null-%s", parent->base.hname, base);
+			snprintf(name, name_sz, "%s//null-%s",
+				 parent->base.hname, base);
 			goto name;
 		}
 		/* fall through to try shorter uniq */
 	}
 
-	name = kmalloc(strlen(parent->base.hname) + 2 + 7 + 8, gfp);
+	name_sz = strlen(parent->base.hname) + 2 + 7 + 8;
+	name = kmalloc(name_sz, gfp);
 	if (!name)
 		return NULL;
-	sprintf(name, "%s//null-%x", parent->base.hname,
-		atomic_inc_return(&parent->ns->uniq_null));
+	snprintf(name, name_sz, "%s//null-%x", parent->base.hname,
+		 atomic_inc_return(&parent->ns->uniq_null));
 
 name:
 	/* lookup to see if this is a dup creation */
@@ -1206,8 +1230,12 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 			if (aa_rawdata_eq(rawdata_ent, udata)) {
 				struct aa_loaddata *tmp;
 
-				tmp = aa_get_profile_loaddata(rawdata_ent);
-				/* check we didn't fail the race */
+				/*
+				 * Entries remain on rawdata_list with
+				 * pcount == 0 until do_ploaddata_rmfs()
+				 * runs; only take a live profile ref.
+				 */
+				tmp = aa_get_profile_loaddata_not0(rawdata_ent);
 				if (tmp) {
 					aa_put_profile_loaddata(udata);
 					udata = tmp;
@@ -1325,6 +1353,16 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 			goto skip;
 		}
 
+		if (!aa_g_export_binary) {
+			if (ent->old && ent->old->rawdata &&
+			    ent->old->dents[AAFS_LOADDATA_DIR]) {
+				/* remove rawdata symlinks because the symlink
+				 * target will be removed
+				 */
+				__aa_remove_rawdata_symlink_dents(ent->old);
+			}
+		}
+
 		/*
 		 * TODO: finer dedup based on profile range in data. Load set
 		 * can differ but profile may remain unchanged
@@ -1335,6 +1373,11 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 		if (ent->old) {
 			share_name(ent->old, ent->new);
 			__replace_profile(ent->old, ent->new);
+			if (aa_g_export_binary) {
+				/* recreate rawdata symlinks */
+				if (!ent->old->rawdata)
+					__aa_create_rawdata_symlink_dents(ent->new);
+			}
 		} else {
 			struct list_head *lh;
 
@@ -1355,12 +1398,15 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 
 out:
 	aa_put_ns(ns);
+
+	ssize_t udata_sz = udata->size;
+
 	aa_put_profile_loaddata(udata);
 	kfree(ns_name);
 
 	if (error)
 		return error;
-	return udata->size;
+	return udata_sz;
 
 fail_lock:
 	mutex_unlock(&ns->lock);

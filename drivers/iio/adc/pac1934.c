@@ -768,7 +768,7 @@ static int pac1934_retrieve_data(struct pac1934_chip_info *info,
 		 * Re-schedule the work for the read registers on timeout
 		 * (to prevent chip registers saturation)
 		 */
-		mod_delayed_work(system_wq, &info->work_chip_rfsh,
+		mod_delayed_work(system_percpu_wq, &info->work_chip_rfsh,
 				 msecs_to_jiffies(PAC1934_MAX_RFSH_LIMIT_MS));
 	}
 
@@ -1351,7 +1351,7 @@ static int pac1934_prep_iio_channels(struct pac1934_chip_info *info, struct iio_
 
 	dyn_ch_struct = devm_kzalloc(dev, channel_size, GFP_KERNEL);
 	if (!dyn_ch_struct)
-		return -EINVAL;
+		return -ENOMEM;
 
 	tmp_data = dyn_ch_struct;
 

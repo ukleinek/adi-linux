@@ -197,16 +197,16 @@ static struct proto_ops __maybe_unused algif_rng_test_ops = {
 	.sendmsg	=	rng_test_sendmsg,
 };
 
-static void *rng_bind(const char *name, u32 type, u32 mask)
+static void *rng_bind(const char *name)
 {
 	struct rng_parent_ctx *pctx;
 	struct crypto_rng *rng;
 
-	pctx = kzalloc(sizeof(*pctx), GFP_KERNEL);
+	pctx = kzalloc_obj(*pctx);
 	if (!pctx)
 		return ERR_PTR(-ENOMEM);
 
-	rng = crypto_alloc_rng(name, type, mask);
+	rng = crypto_alloc_rng(name, 0, AF_ALG_CRYPTOAPI_MASK);
 	if (IS_ERR(rng)) {
 		kfree(pctx);
 		return ERR_CAST(rng);

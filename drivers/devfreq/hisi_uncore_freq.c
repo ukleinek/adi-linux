@@ -9,6 +9,7 @@
 #include <linux/bits.h>
 #include <linux/cleanup.h>
 #include <linux/devfreq.h>
+#include <linux/devfreq-governor.h>
 #include <linux/device.h>
 #include <linux/dev_printk.h>
 #include <linux/errno.h>
@@ -17,7 +18,6 @@
 #include <linux/ktime.h>
 #include <linux/mailbox_client.h>
 #include <linux/module.h>
-#include <linux/mod_devicetable.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/pm_opp.h>
@@ -25,8 +25,6 @@
 #include <linux/topology.h>
 #include <linux/units.h>
 #include <acpi/pcc.h>
-
-#include "governor.h"
 
 struct hisi_uncore_pcc_data {
 	u16 status;

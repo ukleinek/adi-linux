@@ -14,7 +14,6 @@
 #include <linux/efi.h>
 #include <linux/firmware.h>
 #include <linux/i2c.h>
-#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/pci_ids.h>
 #include <linux/pm_runtime.h>
@@ -60,7 +59,6 @@ struct tas2781_hda_i2c_priv {
 	int (*save_calibration)(struct tas2781_hda *h);
 
 	int hda_chip_id;
-	bool skip_calibration;
 };
 
 static int tas2781_get_i2c_res(struct acpi_resource *ares, void *data)
@@ -393,19 +391,6 @@ static int tas2563_save_calibration(struct tas2781_hda *h)
 	r->pow_reg = TAS2563_CAL_POWER;
 	r->tlimit_reg = TAS2563_CAL_TLIM;
 
-	/*
-	 * TAS2781_FMWLIB supports two solutions of calibrated data. One is
-	 * from the driver itself: driver reads the calibrated files directly
-	 * during probe; The other from user space: during init of audio hal,
-	 * the audio hal will pass the calibrated data via kcontrol interface.
-	 * Driver will store this data in "struct calidata" for use. For hda
-	 * device, calibrated data are usunally saved into UEFI. So Hda side
-	 * codec driver use the mixture of these two solutions, driver reads
-	 * the data from UEFI, then store this data in "struct calidata" for
-	 * use.
-	 */
-	p->is_user_space_calidata = true;
-
 	return 0;
 }
 
@@ -492,8 +477,7 @@ static void tasdevice_dspfw_init(void *context)
 	/* If calibrated data occurs error, dsp will still works with default
 	 * calibrated data inside algo.
 	 */
-	if (!hda_priv->skip_calibration)
-		hda_priv->save_calibration(tas_hda);
+	hda_priv->save_calibration(tas_hda);
 }
 
 static void tasdev_fw_ready(const struct firmware *fmw, void *context)
@@ -504,8 +488,8 @@ static void tasdev_fw_ready(const struct firmware *fmw, void *context)
 	struct hda_codec *codec = tas_priv->codec;
 	int ret;
 
-	pm_runtime_get_sync(tas_priv->dev);
-	mutex_lock(&tas_priv->codec_lock);
+	guard(pm_runtime_active_auto)(tas_priv->dev);
+	guard(mutex)(&tas_priv->codec_lock);
 
 	ret = tasdevice_rca_parser(tas_priv, fmw);
 	if (ret)
@@ -541,16 +525,13 @@ static void tasdev_fw_ready(const struct firmware *fmw, void *context)
 	}
 
 out:
-	mutex_unlock(&tas_hda->priv->codec_lock);
 	release_firmware(fmw);
-	pm_runtime_put_autosuspend(tas_hda->dev);
 }
 
 static int tas2781_hda_bind(struct device *dev, struct device *master,
 	void *master_data)
 {
 	struct tas2781_hda *tas_hda = dev_get_drvdata(dev);
-	struct tas2781_hda_i2c_priv *hda_priv = tas_hda->hda_priv;
 	struct hda_component_parent *parent = master_data;
 	struct hda_component *comp;
 	struct hda_codec *codec;
@@ -579,15 +560,7 @@ static int tas2781_hda_bind(struct device *dev, struct device *master,
 		break;
 	}
 
-	/*
-	 * Using ASUS ROG Xbox Ally X (RC73XA) UEFI calibration data
-	 * causes audio dropouts during playback, use fallback data
-	 * from DSP firmware as a workaround.
-	 */
-	if (codec->core.subsystem_id == 0x10431384)
-		hda_priv->skip_calibration = true;
-
-	pm_runtime_get_sync(dev);
+	guard(pm_runtime_active_auto)(dev);
 
 	comp->dev = dev;
 
@@ -596,8 +569,6 @@ static int tas2781_hda_bind(struct device *dev, struct device *master,
 	ret = tascodec_init(tas_hda->priv, codec, THIS_MODULE, tasdev_fw_ready);
 	if (!ret)
 		comp->playback_hook = tas2781_hda_playback_hook;
-
-	pm_runtime_put_autosuspend(dev);
 
 	return ret;
 }
@@ -615,6 +586,9 @@ static void tas2781_hda_unbind(struct device *dev,
 		memset(comp->name, 0, sizeof(comp->name));
 		comp->playback_hook = NULL;
 	}
+
+	request_firmware_nowait_cancel(tas_hda->priv->dev, tas_hda->priv,
+				       tasdev_fw_ready);
 
 	tas2781_hda_remove_controls(tas_hda);
 
@@ -660,6 +634,7 @@ static int tas2781_hda_i2c_probe(struct i2c_client *clt)
 		 */
 		device_name = "TIAS2781";
 		hda_priv->hda_chip_id = HDA_TAS2781;
+		tas_hda->priv->chip_id = TAS2781;
 		hda_priv->save_calibration = tas2781_save_calibration;
 		tas_hda->priv->global_addr = TAS2781_GLOBAL_ADDR;
 	} else if (strstarts(dev_name(&clt->dev), "i2c-TXNW2770")) {
@@ -673,6 +648,7 @@ static int tas2781_hda_i2c_probe(struct i2c_client *clt)
 			     "i2c-TXNW2781:00-tas2781-hda.0")) {
 		device_name = "TXNW2781";
 		hda_priv->hda_chip_id = HDA_TAS2781;
+		tas_hda->priv->chip_id = TAS2781;
 		hda_priv->save_calibration = tas2781_save_calibration;
 		tas_hda->priv->global_addr = TAS2781_GLOBAL_ADDR;
 	} else if (strstr(dev_name(&clt->dev), "INT8866")) {
@@ -817,8 +793,8 @@ static const struct dev_pm_ops tas2781_hda_pm_ops = {
 };
 
 static const struct i2c_device_id tas2781_hda_i2c_id[] = {
-	{ "tas2781-hda" },
-	{}
+	{ .name = "tas2781-hda" },
+	{ }
 };
 
 static const struct acpi_device_id tas2781_acpi_hda_match[] = {

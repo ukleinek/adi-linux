@@ -883,7 +883,8 @@ static void ct_limit_set(const struct ovs_ct_limit_info *info,
 	struct hlist_head *head;
 
 	head = ct_limit_hash_bucket(info, new_ct_limit->zone);
-	hlist_for_each_entry_rcu(ct_limit, head, hlist_node) {
+	hlist_for_each_entry_rcu(ct_limit, head, hlist_node,
+				 lockdep_ovsl_is_held()) {
 		if (ct_limit->zone == new_ct_limit->zone) {
 			hlist_replace_rcu(&ct_limit->hlist_node,
 					  &new_ct_limit->hlist_node);
@@ -1586,15 +1587,13 @@ static int ovs_ct_limit_init(struct net *net, struct ovs_net *ovs_net)
 {
 	int i, err;
 
-	ovs_net->ct_limit_info = kmalloc(sizeof(*ovs_net->ct_limit_info),
-					 GFP_KERNEL);
+	ovs_net->ct_limit_info = kmalloc_obj(*ovs_net->ct_limit_info);
 	if (!ovs_net->ct_limit_info)
 		return -ENOMEM;
 
 	ovs_net->ct_limit_info->default_limit = OVS_CT_LIMIT_DEFAULT;
 	ovs_net->ct_limit_info->limits =
-		kmalloc_array(CT_LIMIT_HASH_BUCKETS, sizeof(struct hlist_head),
-			      GFP_KERNEL);
+		kmalloc_objs(struct hlist_head, CT_LIMIT_HASH_BUCKETS);
 	if (!ovs_net->ct_limit_info->limits) {
 		kfree(ovs_net->ct_limit_info);
 		return -ENOMEM;
@@ -1688,8 +1687,7 @@ static int ovs_ct_limit_set_zone_limit(struct nlattr *nla_zone_limit,
 		} else {
 			struct ovs_ct_limit *ct_limit;
 
-			ct_limit = kmalloc(sizeof(*ct_limit),
-					   GFP_KERNEL_ACCOUNT);
+			ct_limit = kmalloc_obj(*ct_limit, GFP_KERNEL_ACCOUNT);
 			if (!ct_limit)
 				return -ENOMEM;
 
@@ -1800,10 +1798,10 @@ static int ovs_ct_limit_get_zone_limit(struct net *net,
 		} else {
 			rcu_read_lock();
 			limit = ct_limit_get(info, zone);
-			rcu_read_unlock();
 
 			err = __ovs_ct_limit_get_zone_limit(
 				net, info->data, zone, limit, reply);
+			rcu_read_unlock();
 			if (err)
 				return err;
 		}

@@ -17,6 +17,7 @@ static const char * const sq_sw_state_type_name[] = {
 	[MLX5E_SQ_STATE_DIM] = "dim",
 	[MLX5E_SQ_STATE_PENDING_XSK_TX] = "pending_xsk_tx",
 	[MLX5E_SQ_STATE_PENDING_TLS_RX_RESYNC] = "pending_tls_rx_resync",
+	[MLX5E_SQ_STATE_LOCK_NEEDED] = "lock_needed",
 };
 
 static int mlx5e_wait_for_sq_flush(struct mlx5e_txqsq *sq)
@@ -159,13 +160,13 @@ static int mlx5e_tx_reporter_timeout_recover(void *ctx)
 	 * channels are being closed for other reason and this work is not
 	 * relevant anymore.
 	 */
-	while (!netdev_trylock(sq->netdev)) {
+	while (!netdev_trylock(priv->netdev)) {
 		if (!test_bit(MLX5E_STATE_CHANNELS_ACTIVE, &priv->state))
 			return 0;
 		msleep(20);
 	}
 
-	err = mlx5e_health_channel_eq_recover(sq->netdev, eq, sq->cq.ch_stats);
+	err = mlx5e_health_channel_eq_recover(priv->netdev, eq, sq->cq.ch_stats);
 	if (!err) {
 		to_ctx->status = 0; /* this sq recovered */
 		goto out;
@@ -185,7 +186,7 @@ static int mlx5e_tx_reporter_timeout_recover(void *ctx)
 		   "mlx5e_safe_reopen_channels failed recovering from a tx_timeout, err(%d).\n",
 		   err);
 out:
-	netdev_unlock(sq->netdev);
+	netdev_unlock(priv->netdev);
 	return err;
 }
 
