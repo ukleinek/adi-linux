@@ -56,7 +56,7 @@ struct adi_tru {
 struct adi_tru *get_adi_tru_from_node(struct device *dev)
 {
 	struct platform_device *tru_pdev;
-	struct device_node *tru_node;
+	struct device_node *tru_node __free(device_node);
 	struct adi_tru *ret = NULL;
 
 	tru_node = of_parse_phandle(dev->of_node, "adi,tru", 0);
@@ -66,27 +66,21 @@ struct adi_tru *get_adi_tru_from_node(struct device *dev)
 	}
 
 	tru_pdev = of_find_device_by_node(tru_node);
-	if (!tru_pdev) {
-		ret = ERR_PTR(-EPROBE_DEFER);
-		goto cleanup;
-	}
+	if (!tru_pdev)
+		return ERR_PTR(-EPROBE_DEFER);
 
 	ret = dev_get_drvdata(&tru_pdev->dev);
 	if (!ret)
 		ret = ERR_PTR(-EPROBE_DEFER);
 
-cleanup:
-	of_node_put(tru_node);
 	return ret;
 }
-
 EXPORT_SYMBOL(get_adi_tru_from_node);
 
 void put_adi_tru(struct adi_tru *tru)
 {
 	put_device(tru->dev);
 }
-
 EXPORT_SYMBOL(put_adi_tru);
 
 int adi_tru_trigger_device(struct adi_tru *tru, struct device *dev)
@@ -103,7 +97,6 @@ int adi_tru_trigger_device(struct adi_tru *tru, struct device *dev)
 
 	return adi_tru_trigger(tru, master);
 }
-
 EXPORT_SYMBOL(adi_tru_trigger_device);
 
 static int adi_tru_smc_trigger(struct adi_tru *tru, u32 master)
@@ -128,7 +121,6 @@ int adi_tru_trigger(struct adi_tru *tru, u32 master)
 	writel(master, tru->ioaddr + ADI_TRU_REG_MTR);
 	return 0;
 }
-
 EXPORT_SYMBOL(adi_tru_trigger);
 
 /**
@@ -245,10 +237,7 @@ int adi_tru_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct adi_tru *tru;
-	struct resource *res;
 	struct device_node *np = dev->of_node;
-	struct device_node *child;
-	void __iomem *base;
 	u32 master, slave;
 	int ret = 0;
 
@@ -260,18 +249,10 @@ int adi_tru_probe(struct platform_device *pdev)
 	tru->use_smc = of_property_read_bool(np, "adi,use-smc");
 
 	if (!tru->use_smc) {
-		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-		if (!res) {
-			dev_err(dev,
-				"Missing TRU base address (reg property in device tree)\n");
-			return -ENODEV;
-		}
+		void __iomem *base = devm_platform_get_and_ioremap_resource(pdev, 0, NULL);
+		if (IS_ERR(base))
+			return dev_err_probe(dev, PTR_ERR(base), "Cannot map TRU base address\n");
 
-		base = devm_ioremap(dev, res->start, resource_size(res));
-		if (IS_ERR(base)) {
-			dev_err(dev, "Cannot map TRU base address\n");
-			return -PTR_ERR(base);
-		}
 		tru->ioaddr = base;
 	}
 
@@ -295,6 +276,8 @@ int adi_tru_probe(struct platform_device *pdev)
 	 * because all of the TRU is restricted from access in that case
 	 */
 	if (!tru->use_smc) {
+		struct device_node *child __free(device_node) = NULL;
+
 		/*
 		 * Initialize statically defined triggers from the device tree
 		 * as child nodes, for example something like this
@@ -309,15 +292,11 @@ int adi_tru_probe(struct platform_device *pdev)
 		 *  };
 		 * };
 		 */
-		child = NULL;
 		while ((child = of_get_next_child(np, child))) {
 			ret = adi_tru_set_trigger(tru, child, child);
-			if (ret) {
-				of_node_put(child);
-				dev_err(dev,
-					"Invalid static trigger map in TRU device tree entry\n");
-				return ret;
-			}
+			if (ret)
+				return dev_err_probe(dev, ret,
+						     "Invalid static trigger map in TRU device tree entry\n");
 		}
 
 		writel(0x01, tru->ioaddr + ADI_TRU_REG_GCTL);
@@ -330,36 +309,26 @@ int adi_tru_probe(struct platform_device *pdev)
 	tru->mbox.of_xlate   = adi_tru_mbox_xlate;
 
 	ret = devm_mbox_controller_register(dev, &tru->mbox);
-	if (ret) {
-		dev_err(dev, "Failed to register mailbox controller: %d\n", ret);
-		return ret;
-	}
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to register mailbox controller\n");
 
 	dev_set_drvdata(dev, tru);
 	return 0;
 }
 
-void adi_tru_remove(struct platform_device *pdev)
-{
-	return;
-}
-
 static const struct of_device_id adi_tru_dt_ids[] = {
-	{.compatible = "adi,trigger-routing-unit" },
-	{ },
+	{ .compatible = "adi,trigger-routing-unit" },
+	{ }
 };
-
 MODULE_DEVICE_TABLE(of, adi_tru_dt_ids);
 
 static struct platform_driver adi_tru_driver = {
 	.probe = adi_tru_probe,
-	.remove = adi_tru_remove,
 	.driver = {
-		   .name = "adi-trigger-routing-unit",
-		   .of_match_table = of_match_ptr(adi_tru_dt_ids),
-		    },
+		.name = "adi-trigger-routing-unit",
+		.of_match_table = adi_tru_dt_ids,
+	},
 };
-
 module_platform_driver(adi_tru_driver);
 
 MODULE_DESCRIPTION("ADI Trigger Routing Unit driver");
